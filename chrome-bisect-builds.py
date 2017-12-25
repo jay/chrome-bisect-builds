@@ -21,7 +21,7 @@ ASAN_BASE_URL = ('http://commondatastorage.googleapis.com'
                  '/chromium-browser-asan')
 
 # URL template for viewing changelogs between revisions.
-CHANGELOG_URL = ('https://chromium.googlesource.com/chromium/src/+log/%s..%s?pretty=fuller')
+CHANGELOG_URL = ('https://chromium.googlesource.com/chromium/src/+log/%s..%s')
 
 # URL to convert SVN revision to git hash.
 CRREV_URL = ('https://cr-rev.appspot.com/_ah/api/crrev/v1/redirect/')
@@ -83,9 +83,14 @@ import threading
 import urllib
 from xml.etree import ElementTree
 import glob, bisect, colorama, msvcrt
+from colorama import init
+init(convert=True)
 
-SNAPSHOTS_DIR = r'E:\install\bisect'
-SEVEN_ZIP = r'C:\app\sys\7-Zip\7z.exe'
+if not sys.platform.startswith('win'):
+  raise Exception('Only Windows platform supported in this modified script. Fix UnzipFilenameToDir for other platforms.')
+
+SNAPSHOTS_DIR = r'C:\j\Chrome\snapshots'
+SEVEN_ZIP = r'C:\Program Files\7-Zip\7z.exe'
 COLOR_DETAILS = colorama.Fore.BLACK + colorama.Style.BRIGHT + colorama.Back.BLACK
 COLOR_INFO = colorama.Fore.CYAN + colorama.Style.BRIGHT + colorama.Back.BLACK
 COLOR_INFO2 = colorama.Fore.CYAN + colorama.Style.NORMAL + colorama.Back.BLACK
@@ -484,16 +489,14 @@ class PathContext(object):
 
 def UnzipFilenameToDir(filename, directory):
   """Unzip |filename| to |directory|."""
-  cwd = os.getcwd()
   if not os.path.isabs(filename):
     filename = os.path.join(cwd, filename)
   # Make base.
   if not os.path.isdir(directory):
     os.mkdir(directory)
-  os.chdir(directory)
-  os.system(r'("{0}" x "{1}" 1>nul & "{0}" x Chrome.7z 1>nul & del Chrome.7z)'.format(SEVEN_ZIP, filename))
-  os.chdir(cwd)
 
+  if os.system(r'("{0}" x "{1}" "-o{2}" 1>nul && "{0}" x "{2}\Chrome.7z" "-o{2}" 1>nul && del "{2}\Chrome.7z")'.format(SEVEN_ZIP, filename, directory)):
+    raise RuntimeError('unzip failed')
 
 def FetchRevision(context, rev, filename, state,
                   quit_event=None, progress_event=None):
@@ -727,7 +730,7 @@ def VerifyEndpoint(fetch, context, rev, profile, num_runs, command, try_args,
     (exit_status, stdout, stderr) = RunRevision(
         context, rev, fetch.zip_file, profile, num_runs, command, try_args)
   except Exception, e:
-    print >> sys.stderr, COLOR_ERROR + e + COLOR_NORMAL
+    print >> sys.stderr, COLOR_ERROR, e, COLOR_NORMAL
   if (evaluate(rev, exit_status, stdout, stderr) != expected_answer):
     print COLOR_ERROR + 'Unexpected result at a range boundary! Your range is not correct.' + COLOR_NORMAL
     raise SystemExit
@@ -1248,9 +1251,6 @@ def main():
 
     #print 'CHANGELOG URL:'
     PrintChangeLog(min_chromium_rev, max_chromium_rev)
-
-    print COLOR_DETAILS + 'Suspecting r'
-    print COLOR_DETAILS + 'Landed in'
 
 
 if __name__ == '__main__':
