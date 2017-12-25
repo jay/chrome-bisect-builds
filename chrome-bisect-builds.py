@@ -21,7 +21,7 @@ ASAN_BASE_URL = ('http://commondatastorage.googleapis.com'
                  '/chromium-browser-asan')
 
 # URL template for viewing changelogs between revisions.
-CHANGELOG_URL = ('https://chromium.googlesource.com/chromium/src/+log/%s..%s')
+CHANGELOG_URL = ('https://chromium.googlesource.com/chromium/src/+log/%s..%s?pretty=fuller')
 
 # URL to convert SVN revision to git hash.
 CRREV_URL = ('https://cr-rev.appspot.com/_ah/api/crrev/v1/redirect/')
@@ -34,10 +34,8 @@ BLINK_CHANGELOG_URL = ('http://build.chromium.org'
                       '/f/chromium/perf/dashboard/ui/changelog_blink.html'
                       '?url=/trunk&range=%d%%3A%d')
 
-DONE_MESSAGE_GOOD_MIN = ('You are probably looking for a change made after %s ('
-                         'known good), but no later than %s (first known bad).')
-DONE_MESSAGE_GOOD_MAX = ('You are probably looking for a change made after %s ('
-                         'known bad), but no later than %s (first known good).')
+DONE_MESSAGE_GOOD_MIN = ('Bisect info: %s (good) - %s (bad)')
+DONE_MESSAGE_GOOD_MAX = ('Bisect info: %s (bad) - %s (good)')
 
 CHROMIUM_GITHASH_TO_SVN_URL = (
     'https://chromium.googlesource.com/chromium/src/+/%s?format=json')
@@ -72,7 +70,6 @@ CREDENTIAL_ERROR_MESSAGE = ('You are attempting to access protected data with '
 
 ###############################################################################
 
-import httplib
 import json
 import optparse
 import os
@@ -84,10 +81,42 @@ import sys
 import tempfile
 import threading
 import urllib
-from distutils.version import LooseVersion
 from xml.etree import ElementTree
-import zipfile
+import glob, bisect, colorama, msvcrt
 
+SNAPSHOTS_DIR = r'E:\install\bisect'
+SEVEN_ZIP = r'C:\app\sys\7-Zip\7z.exe'
+COLOR_DETAILS = colorama.Fore.BLACK + colorama.Style.BRIGHT + colorama.Back.BLACK
+COLOR_INFO = colorama.Fore.CYAN + colorama.Style.BRIGHT + colorama.Back.BLACK
+COLOR_INFO2 = colorama.Fore.CYAN + colorama.Style.NORMAL + colorama.Back.BLACK
+COLOR_BOLD = colorama.Fore.WHITE + colorama.Style.BRIGHT + colorama.Back.BLACK
+COLOR_HIGHLIGHT = colorama.Fore.YELLOW + colorama.Style.BRIGHT + colorama.Back.BLACK
+COLOR_NORMAL = colorama.Fore.WHITE + colorama.Style.NORMAL + colorama.Back.BLACK
+COLOR_PROGRESS = colorama.Fore.WHITE + colorama.Style.BRIGHT + colorama.Back.BLACK
+COLOR_GOOD = colorama.Fore.GREEN + colorama.Style.BRIGHT + colorama.Back.BLACK
+COLOR_BAD = colorama.Fore.RED + colorama.Style.BRIGHT + colorama.Back.BLACK
+COLOR_ERROR = colorama.Fore.LIGHTWHITE_EX + colorama.Back.RED + colorama.Style.NORMAL
+ANSI_MOVE_1_LINE_UP = '\x1b[1A'
+ANSI_MOVE_2_LINES_UP = '\x1b[2A'
+ANSI_CLEAR_BELOW = '\x1b[0J'
+
+existing_revs_path = {}
+existing_revs_path_x64 = {}
+for path in (
+  glob.glob(os.path.join(SNAPSHOTS_DIR, '*.7z')) +
+  glob.glob(os.path.join(SNAPSHOTS_DIR, '*.exe'))
+):
+  rev = re.search(r'(?<=\\)\d+(?=(?:x64)?(?:-mini_installer)?\.(?:exe|7z))|$', path).group(0)
+  try:
+    rev = int(rev)
+    if 'x64' in path:
+      existing_revs_path_x64[rev] = path
+      existing_revs_path[rev] = existing_revs_path.get(rev, None) or path
+    else:
+      existing_revs_path[rev] = path
+  except: pass
+existing_revs = sorted(existing_revs_path.keys())
+existing_revs_x64 = sorted(existing_revs_path_x64.keys())
 
 class PathContext(object):
   """A PathContext is used to carry the information used to construct URLs and
@@ -135,8 +164,8 @@ class PathContext(object):
       self.archive_name = 'chrome-mac.zip'
       self._archive_extract_dir = 'chrome-mac'
     elif self.platform in ('win', 'win64'):
-      self.archive_name = 'chrome-win32.zip'
-      self._archive_extract_dir = 'chrome-win32'
+      self.archive_name = 'mini_installer.exe'
+      self._archive_extract_dir = 'Chrome-bin'
       self._binary_name = 'chrome.exe'
     else:
       raise Exception('Invalid platform: %s' % self.platform)
@@ -319,7 +348,7 @@ class PathContext(object):
       try:
         data = json.loads(response.read()[4:])
       except ValueError:
-        print 'ValueError for JSON URL: %s' % json_url
+        print COLOR_ERROR + ('ValueError for JSON URL: %s' % json_url) + COLOR_NORMAL
         raise ValueError
     else:
       raise ValueError
@@ -336,7 +365,7 @@ class PathContext(object):
                              message[len(message)-1])
           if result:
             return result.group(1)
-    print 'Failed to get svn revision number for %s' % git_sha1
+    print COLOR_ERROR + ('Failed to get svn revision number for %s' % git_sha1) + COLOR_NORMAL
     raise ValueError
 
   def _GetSVNRevisionFromGitHashFromGitCheckout(self, git_sha1, depot):
@@ -395,7 +424,7 @@ class PathContext(object):
             revisions = cache.get(cache_dict_key, [])
             githash_svn_dict = cache.get('githash_svn_dict', {})
             if revisions:
-              print 'Loaded revisions %d-%d from %s' % (revisions[0],
+              print COLOR_DETAILS + 'Loaded revisions %d-%d from %s' % (revisions[0],
                   revisions[-1], cache_filename)
             return (revisions, githash_svn_dict)
         except (EnvironmentError, ValueError):
@@ -411,7 +440,7 @@ class PathContext(object):
         try:
           with open(cache_filename, 'w') as cache_file:
             json.dump(cache, cache_file)
-          print 'Saved revisions %d-%d to %s' % (
+          print COLOR_DETAILS + 'Saved revisions %d-%d to %s' % (
               revlist_all[0], revlist_all[-1], cache_filename)
         except EnvironmentError:
           pass
@@ -450,6 +479,7 @@ class PathContext(object):
                                                    revlist_all,
                                                    self,
                                                    self.bad_revision)
+    print
     return revlist
 
 def UnzipFilenameToDir(filename, directory):
@@ -457,30 +487,16 @@ def UnzipFilenameToDir(filename, directory):
   cwd = os.getcwd()
   if not os.path.isabs(filename):
     filename = os.path.join(cwd, filename)
-  zf = zipfile.ZipFile(filename)
   # Make base.
   if not os.path.isdir(directory):
     os.mkdir(directory)
   os.chdir(directory)
-  # Extract files.
-  for info in zf.infolist():
-    name = info.filename
-    if name.endswith('/'):  # dir
-      if not os.path.isdir(name):
-        os.makedirs(name)
-    else:  # file
-      directory = os.path.dirname(name)
-      if not os.path.isdir(directory):
-        os.makedirs(directory)
-      out = open(name, 'wb')
-      out.write(zf.read(name))
-      out.close()
-    # Set permissions. Permission info in external_attr is shifted 16 bits.
-    os.chmod(name, info.external_attr >> 16L)
+  os.system(r'("{0}" x "{1}" 1>nul & "{0}" x Chrome.7z 1>nul & del Chrome.7z)'.format(SEVEN_ZIP, filename))
   os.chdir(cwd)
 
 
-def FetchRevision(context, rev, filename, quit_event=None, progress_event=None):
+def FetchRevision(context, rev, filename, state,
+                  quit_event=None, progress_event=None):
   """Downloads and unzips revision |rev|.
   @param context A PathContext instance.
   @param rev The Chromium revision number/tag to download.
@@ -491,20 +507,26 @@ def FetchRevision(context, rev, filename, quit_event=None, progress_event=None):
                     to indicate that the progress of the download should be
                     displayed.
   """
+  state['last_output'] = ''
   def ReportHook(blocknum, blocksize, totalsize):
+    size = min(blocknum * blocksize, totalsize)
+    downloading = size < totalsize or totalsize == -1
+    state['incomplete'] = downloading
     if quit_event and quit_event.isSet():
+      if downloading:
+        sys.stdout.write(COLOR_DETAILS + '\r' + state['last_output'])
       raise RuntimeError('Aborting download of revision %s' % str(rev))
     if progress_event and progress_event.isSet():
-      size = blocknum * blocksize
       if totalsize == -1:  # Total size not known.
         progress = 'Received %d bytes' % size
       else:
-        size = min(totalsize, size)
         progress = 'Received %d of %d bytes, %.2f%%' % (
             size, totalsize, 100.0 * size / totalsize)
       # Send a \r to let all progress messages use just one line of output.
-      sys.stdout.write('\r' + progress)
+      color = COLOR_PROGRESS if size < totalsize else COLOR_DETAILS
+      sys.stdout.write(color + '\r' + progress)
       sys.stdout.flush()
+      state['last_output'] = progress
   download_url = context.GetDownloadURL(rev)
   try:
     urllib.urlretrieve(download_url, filename, ReportHook)
@@ -517,7 +539,7 @@ def FetchRevision(context, rev, filename, quit_event=None, progress_event=None):
 
 def RunRevision(context, revision, zip_file, profile, num_runs, command, args):
   """Given a zipped revision, unzip it and run the test."""
-  print 'Trying revision %s...' % str(revision)
+  print COLOR_BOLD + 'Trying revision %s...' % revision
 
   # Create a temp directory and unzip the revision into it.
   cwd = os.getcwd()
@@ -529,8 +551,9 @@ def RunRevision(context, revision, zip_file, profile, num_runs, command, args):
   if context.platform == 'chromeos':
     icudtl_path = 'third_party/icu/common/icudtl.dat'
     if not os.access(icudtl_path, os.F_OK):
-      print 'Couldn\'t find: ' + icudtl_path
-      print ('The path might have changed. Please look for the data under '
+      print COLOR_ERROR + 'Couldn\'t find: ' + icudtl_path
+      print (COLOR_NORMAL +
+             'The path might have changed. Please look for the data under '
              'third_party/icu and update bisect-build.py')
       sys.exit()
     os.system('cp %s %s/chrome-linux/' % (icudtl_path, tempdir))
@@ -566,6 +589,7 @@ def RunRevision(context, revision, zip_file, profile, num_runs, command, args):
                                stderr=subprocess.PIPE)
     (stdout, stderr) = subproc.communicate()
     results.append((subproc.returncode, stdout, stderr))
+  print ANSI_MOVE_1_LINE_UP + ANSI_CLEAR_BELOW,
   os.chdir(cwd)
   try:
     shutil.rmtree(tempdir, True)
@@ -585,15 +609,27 @@ def RunRevision(context, revision, zip_file, profile, num_runs, command, args):
 def AskIsGoodBuild(rev, exit_status, stdout, stderr):
   """Asks the user whether build |rev| is good or bad."""
   # Loop until we get a response that we can parse.
+  colorized_question = COLOR_BOLD + re.sub(
+    r'\((\d+|\w)\)',
+    COLOR_HIGHLIGHT + r'\1' + COLOR_BOLD,
+    '\rRevision (%s) is [(g)ood/(b)ad/(r)etry/(u)nknown/(s)tdout/(q)uit]: ' % rev
+  )
+  def overwrite_output(color, status):
+    print color + '\r' + 'Revision %s is %s' % (rev, status) + ANSI_CLEAR_BELOW
+  print colorized_question,
   while True:
-    response = raw_input('Revision %s is '
-                         '[(g)ood/(b)ad/(r)etry/(u)nknown/(s)tdout/(q)uit]: ' %
-                         str(rev))
+    response = msvcrt.getch() #raw_input()
     if response in ('g', 'b', 'r', 'u'):
+      if response == 'g': overwrite_output(COLOR_GOOD, 'GOOD')
+      if response == 'b': overwrite_output(COLOR_BAD, 'BAD')
+      if response == 'u': overwrite_output(COLOR_DETAILS, 'UNKNOWN')
+      if response == 'r': print COLOR_DETAILS + '\rRetrying...' + ANSI_CLEAR_BELOW
       return response
     if response == 'q':
+      print 'q'
       raise SystemExit()
     if response == 's':
+      print 's'
       print stdout
       print stderr
 
@@ -606,21 +642,21 @@ def IsGoodASANBuild(rev, exit_status, stdout, stderr):
   if stderr:
     bad_count = 0
     for line in stderr.splitlines():
-      print line
+      print COLOR_NORMAL + line
       if line.find('ERROR: AddressSanitizer:') != -1:
         bad_count += 1
     if bad_count > 0:
-      print 'Revision %d determined to be bad.' % rev
+      print COLOR_NORMAL +  'Revision %d determined to be bad.' % rev
       return 'b'
   return AskIsGoodBuild(rev, exit_status, stdout, stderr)
 
 
 def DidCommandSucceed(rev, exit_status, stdout, stderr):
   if exit_status:
-    print 'Bad revision: %s' % rev
+    print COLOR_NORMAL + 'Bad revision: %s' % rev
     return 'b'
   else:
-    print 'Good revision: %s' % rev
+    print COLOR_NORMAL + 'Good revision: %s' % rev
     return 'g'
 
 
@@ -633,16 +669,24 @@ class DownloadJob(object):
     self.context = context
     self.name = name
     self.rev = rev
-    self.zip_file = zip_file
+    self.local_file = existing_revs_path.get(rev)
+    self.zip_file = self.local_file or zip_file
     self.quit_event = threading.Event()
     self.progress_event = threading.Event()
     self.thread = None
+    self.download_state = {'incomplete': None}
 
   def Start(self):
     """Starts the download."""
+    if self.local_file:
+      self.thread = threading.Thread()
+      self.thread.start()
+      return
+
     fetchargs = (self.context,
                  self.rev,
                  self.zip_file,
+                 self.download_state,
                  self.quit_event,
                  self.progress_event)
     self.thread = threading.Thread(target=FetchRevision,
@@ -655,13 +699,15 @@ class DownloadJob(object):
     assert self.thread, 'DownloadJob must be started before Stop is called.'
     self.quit_event.set()
     self.thread.join()
-    os.unlink(self.zip_file)
+    if self.download_state['incomplete'] and not existing_revs_path.has_key(self.rev):
+      print COLOR_DETAILS + 'Deleting incomplete %s' % self.zip_file
+      os.unlink(self.zip_file)
 
   def WaitFor(self):
     """Prints a message and waits for the download to complete. The download
     must have been started previously."""
     assert self.thread, 'DownloadJob must be started before WaitFor is called.'
-    print 'Downloading revision %s...' % str(self.rev)
+    print COLOR_INFO + 'Downloading revision %s...' % self.rev
     self.progress_event.set()  # Display progress of download.
     try:
       while self.thread.isAlive():
@@ -671,6 +717,7 @@ class DownloadJob(object):
     except (KeyboardInterrupt, SystemExit):
       self.Stop()
       raise
+    print ANSI_MOVE_1_LINE_UP + ANSI_CLEAR_BELOW,
 
 
 def VerifyEndpoint(fetch, context, rev, profile, num_runs, command, try_args,
@@ -680,9 +727,9 @@ def VerifyEndpoint(fetch, context, rev, profile, num_runs, command, try_args,
     (exit_status, stdout, stderr) = RunRevision(
         context, rev, fetch.zip_file, profile, num_runs, command, try_args)
   except Exception, e:
-    print >> sys.stderr, e
+    print >> sys.stderr, COLOR_ERROR + e + COLOR_NORMAL
   if (evaluate(rev, exit_status, stdout, stderr) != expected_answer):
-    print 'Unexpected result at a range boundary! Your range is not correct.'
+    print COLOR_ERROR + 'Unexpected result at a range boundary! Your range is not correct.' + COLOR_NORMAL
     raise SystemExit
 
 
@@ -727,13 +774,20 @@ def Bisect(context,
   bad_rev = context.bad_revision
   cwd = os.getcwd()
 
-  print 'Downloading list of known revisions...',
+  print COLOR_DETAILS + 'Downloading list of known revisions...',
   if not context.use_local_cache:
-    print '(use --use-local-cache to cache and re-use the list of revisions)'
+    print COLOR_DETAILS + '(use --use-local-cache to cache and re-use the list of revisions)'
   else:
     print
-  _GetDownloadPath = lambda rev: os.path.join(cwd,
-      '%s-%s' % (str(rev), context.archive_name))
+  def _GetDownloadPath(rev):
+    return os.path.join(
+      SNAPSHOTS_DIR,
+      '%s%s-%s' % (
+        rev,
+        'x64' if context.platform == 'win64' else '',
+        context.archive_name
+      )
+    ).replace('-mini_installer.exe', '.7z')
   revlist = context.GetRevList()
 
   # Get a list of revisions to bisect across.
@@ -741,11 +795,30 @@ def Bisect(context,
     msg = 'We don\'t have enough builds to bisect. revlist: %s' % revlist
     raise RuntimeError(msg)
 
+  def maybe_use_local_installer(pivot, min_index, max_index):
+    rev = revlist[pivot]
+    revs = existing_revs_x64 if context.platform == 'win64' else existing_revs
+    index = bisect.bisect(revs, rev)
+    if index == len(revs):
+      return rev, pivot
+    next = revs[index]
+    prev = revs[index - 1] if index > 0 else 0
+    max_rev = revlist[max_index]
+    min_rev = revlist[min_index]
+    if next >= max_rev and prev <= min_rev:
+      return rev, pivot
+    if next >= max_rev:
+      return prev, bisect.bisect_left(revlist, prev, minrev, maxrev)
+    if prev <= min_rev:
+      return next, bisect.bisect_left(revlist, next, minrev, maxrev)
+    rev = prev if rev - prev < next - rev else next
+    return rev, bisect.bisect_left(revlist, rev, minrev, maxrev)
+
   # Figure out our bookends and first pivot point; fetch the pivot revision.
   minrev = 0
   maxrev = len(revlist) - 1
   pivot = maxrev / 2
-  rev = revlist[pivot]
+  rev, pivot = maybe_use_local_installer(pivot, minrev, maxrev)
   fetch = DownloadJob(context, 'initial_fetch', rev, _GetDownloadPath(rev))
   fetch.Start()
 
@@ -764,7 +837,7 @@ def Bisect(context,
       VerifyEndpoint(maxrev_fetch, context, revlist[maxrev], profile, num_runs,
           command, try_args, evaluate, 'g' if bad_rev < good_rev else 'b')
     except (KeyboardInterrupt, SystemExit):
-      print 'Cleaning up...'
+      print COLOR_DETAILS + 'Cleaning up...'
       fetch.Stop()
       sys.exit(0)
     finally:
@@ -779,8 +852,8 @@ def Bisect(context,
       min_str, max_str = 'bad', 'good'
     else:
       min_str, max_str = 'good', 'bad'
-    print 'Bisecting range [%s (%s), %s (%s)].' % (revlist[minrev], min_str,
-                                                   revlist[maxrev], max_str)
+    print COLOR_NORMAL + '\rBisecting range [%s (%s), %s (%s)], %d revs.' % (revlist[minrev], min_str,
+                                                   revlist[maxrev], max_str, revlist[maxrev] - revlist[minrev])
 
     # Pre-fetch next two possible pivots
     #   - down_pivot is the next revision to check if the current revision turns
@@ -790,7 +863,7 @@ def Bisect(context,
     down_pivot = int((pivot - minrev) / 2) + minrev
     down_fetch = None
     if down_pivot != pivot and down_pivot != minrev:
-      down_rev = revlist[down_pivot]
+      down_rev, down_pivot = maybe_use_local_installer(down_pivot, minrev, pivot)
       down_fetch = DownloadJob(context, 'down_fetch', down_rev,
                                _GetDownloadPath(down_rev))
       down_fetch.Start()
@@ -798,7 +871,7 @@ def Bisect(context,
     up_pivot = int((maxrev - pivot) / 2) + pivot
     up_fetch = None
     if up_pivot != pivot and up_pivot != maxrev:
-      up_rev = revlist[up_pivot]
+      up_rev, up_pivot = maybe_use_local_installer(up_pivot, pivot, maxrev)
       up_fetch = DownloadJob(context, 'up_fetch', up_rev,
                              _GetDownloadPath(up_rev))
       up_fetch.Start()
@@ -873,7 +946,7 @@ def Bisect(context,
       else:
         assert False, 'Unexpected return value from evaluate(): ' + answer
     except (KeyboardInterrupt, SystemExit):
-      print 'Cleaning up...'
+      print COLOR_DETAILS + 'Cleaning up...'
       for f in [_GetDownloadPath(rev),
                 _GetDownloadPath(revlist[down_pivot]),
                 _GetDownloadPath(revlist[up_pivot])]:
@@ -923,7 +996,7 @@ def GetBlinkRevisionForChromiumRevision(context, rev):
     try:
       data = json.loads(url.read())
     except ValueError:
-      print 'ValueError for JSON URL: %s' % file_url
+      print COLOR_ERROR + ('ValueError for JSON URL: %s' % file_url) + COLOR_NORMAL
       raise ValueError
   else:
     raise ValueError
@@ -965,7 +1038,7 @@ def GetChromiumRevision(context, url):
       return int(latest_revision)
     return context.GetSVNRevisionFromGitHash(latest_revision)
   except Exception:
-    print 'Could not determine latest revision. This could be bad...'
+    print COLOR_ERROR + 'Could not determine latest revision. This could be bad...' + COLOR_NORMAL
     return 999999999
 
 def GetGitHashFromSVNRevision(svn_revision):
@@ -979,8 +1052,9 @@ def GetGitHashFromSVNRevision(svn_revision):
 def PrintChangeLog(min_chromium_rev, max_chromium_rev):
   """Prints the changelog URL."""
 
-  print ('  ' + CHANGELOG_URL % (GetGitHashFromSVNRevision(min_chromium_rev),
-         GetGitHashFromSVNRevision(max_chromium_rev)))
+  print (COLOR_NORMAL +
+         CHANGELOG_URL % (GetGitHashFromSVNRevision(min_chromium_rev)[:8],
+         GetGitHashFromSVNRevision(max_chromium_rev)[:8]))
 
 
 def main():
@@ -1004,7 +1078,7 @@ def main():
   choices = ['mac', 'mac64', 'win', 'win64', 'linux', 'linux64', 'linux-arm',
              'chromeos']
   parser.add_option('-a', '--archive',
-                    choices=choices,
+                    choices=choices, default='win',
                     help='The buildbot archive to bisect [%s].' %
                          '|'.join(choices))
   parser.add_option('-b', '--bad',
@@ -1020,7 +1094,7 @@ def main():
                          '/opt/google/chrome/PepperFlash/'
                          'libpepflashplayer.so).')
   parser.add_option('-g', '--good',
-                    type='str',
+                    type='str', default='999999',
                     help='A good revision to start bisection. ' +
                          'May be earlier or later than the bad revision. ' +
                          'Default is 0.')
@@ -1057,7 +1131,7 @@ def main():
   parser.add_option('--use-local-cache',
                     dest='use_local_cache',
                     action='store_true',
-                    default=False,
+                    default=True,
                     help='Use a local file in the current directory to cache '
                          'a list of known revisions to speed up the '
                          'initialization of this script.')
@@ -1071,15 +1145,15 @@ def main():
   (opts, args) = parser.parse_args()
 
   if opts.archive is None:
-    print 'Error: missing required parameter: --archive'
-    print
+    print COLOR_ERROR + 'Error: missing required parameter: --archive' + COLOR_NORMAL + '\n'
     parser.print_help()
     return 1
 
   if opts.asan:
     supported_platforms = ['linux', 'mac', 'win']
     if opts.archive not in supported_platforms:
-      print 'Error: ASAN bisecting only supported on these platforms: [%s].' % (
+      print COLOR_ERROR + \
+            'Error: ASAN bisecting only supported on these platforms: [%s].' % (
             '|'.join(supported_platforms))
       return 1
 
@@ -1113,8 +1187,10 @@ def main():
   context.bad_revision = int(context.bad_revision)
 
   if opts.times < 1:
-    print('Number of times to run (%d) must be greater than or equal to 1.' %
+    print(COLOR_ERROR +
+          'Number of times to run (%d) must be greater than or equal to 1.' %
           opts.times)
+    print COLOR_NORMAL
     parser.print_help()
     return 1
 
@@ -1134,6 +1210,8 @@ def main():
       context, opts.times, opts.command, args, opts.profile,
       evaluator, opts.verify_range)
 
+  print
+
   # Get corresponding blink revisions.
   try:
     min_blink_rev = GetBlinkRevisionForChromiumRevision(context,
@@ -1147,27 +1225,32 @@ def main():
   if opts.blink:
     # We're done. Let the user know the results in an official manner.
     if good_rev > bad_rev:
-      print DONE_MESSAGE_GOOD_MAX % (str(min_blink_rev), str(max_blink_rev))
+      print COLOR_BOLD + DONE_MESSAGE_GOOD_MAX % (str(min_blink_rev), str(max_blink_rev))
     else:
-      print DONE_MESSAGE_GOOD_MIN % (str(min_blink_rev), str(max_blink_rev))
+      print COLOR_BOLD + DONE_MESSAGE_GOOD_MIN % (str(min_blink_rev), str(max_blink_rev))
 
-    print 'BLINK CHANGELOG URL:'
-    print '  ' + BLINK_CHANGELOG_URL % (max_blink_rev, min_blink_rev)
+    print COLOR_NORMAL + \
+          'BLINK CHANGELOG URL:  ' + \
+          BLINK_CHANGELOG_URL % (max_blink_rev, min_blink_rev)
 
   else:
     # We're done. Let the user know the results in an official manner.
     if good_rev > bad_rev:
-      print DONE_MESSAGE_GOOD_MAX % (str(min_chromium_rev),
+      print COLOR_BOLD + DONE_MESSAGE_GOOD_MAX % (str(min_chromium_rev),
                                      str(max_chromium_rev))
     else:
-      print DONE_MESSAGE_GOOD_MIN % (str(min_chromium_rev),
+      print COLOR_BOLD + DONE_MESSAGE_GOOD_MIN % (str(min_chromium_rev),
                                      str(max_chromium_rev))
     if min_blink_rev != max_blink_rev:
-      print ('NOTE: There is a Blink roll in the range, '
+      print (COLOR_NORMAL +
+             'NOTE: There is a Blink roll in the range, '
              'you might also want to do a Blink bisect.')
 
-    print 'CHANGELOG URL:'
+    #print 'CHANGELOG URL:'
     PrintChangeLog(min_chromium_rev, max_chromium_rev)
+
+    print COLOR_DETAILS + 'Suspecting r'
+    print COLOR_DETAILS + 'Landed in'
 
 
 if __name__ == '__main__':
