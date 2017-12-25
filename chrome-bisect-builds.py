@@ -72,6 +72,7 @@ CREDENTIAL_ERROR_MESSAGE = ('You are attempting to access protected data with '
 
 ###############################################################################
 
+import glob
 import httplib
 import json
 import optparse
@@ -452,16 +453,32 @@ class PathContext(object):
                                                    self.bad_revision)
     return revlist
 
+
+def IsMac():
+  return sys.platform.startswith('darwin')
+
+
 def UnzipFilenameToDir(filename, directory):
   """Unzip |filename| to |directory|."""
   cwd = os.getcwd()
   if not os.path.isabs(filename):
     filename = os.path.join(cwd, filename)
-  zf = zipfile.ZipFile(filename)
   # Make base.
   if not os.path.isdir(directory):
     os.mkdir(directory)
   os.chdir(directory)
+
+  # The Python ZipFile does not support symbolic links, which makes it
+  # unsuitable for Mac builds. so use ditto instead.
+  if IsMac():
+    unzip_cmd = ['ditto', '-x', '-k', filename, '.']
+    proc = subprocess.Popen(unzip_cmd, bufsize=0, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE)
+    proc.communicate()
+    os.chdir(cwd)
+    return
+
+  zf = zipfile.ZipFile(filename)
   # Extract files.
   for info in zf.infolist():
     name = info.filename
@@ -515,6 +532,24 @@ def FetchRevision(context, rev, filename, quit_event=None, progress_event=None):
     pass
 
 
+def CopyMissingFileFromCurrentSource(src_glob, dst):
+  """Work around missing files in archives.
+  This happens when archives of Chrome don't contain all of the files
+  needed to build it. In many cases we can work around this using
+  files from the current checkout. The source is in the form of a glob
+  so that it can try to look for possible sources of the file in
+  multiple locations, but we just arbitrarily try the first match.
+
+  Silently fail if this doesn't work because we don't yet have clear
+  markers for builds that require certain files or a way to test
+  whether or not launching Chrome succeeded.
+  """
+  if not os.path.exists(dst):
+    matches = glob.glob(src_glob)
+    if matches:
+      shutil.copy2(matches[0], dst)
+
+
 def RunRevision(context, revision, zip_file, profile, num_runs, command, args):
   """Given a zipped revision, unzip it and run the test."""
   print 'Trying revision %s...' % str(revision)
@@ -524,16 +559,13 @@ def RunRevision(context, revision, zip_file, profile, num_runs, command, args):
   tempdir = tempfile.mkdtemp(prefix='bisect_tmp')
   UnzipFilenameToDir(zip_file, tempdir)
 
-  # Hack: Chrome OS archives are missing icudtl.dat; try to copy it from
-  # the local directory.
+  # Hack: Some Chrome OS archives are missing some files; try to copy them
+  # from the local directory.
   if context.platform == 'chromeos':
-    icudtl_path = 'third_party/icu/common/icudtl.dat'
-    if not os.access(icudtl_path, os.F_OK):
-      print 'Couldn\'t find: ' + icudtl_path
-      print ('The path might have changed. Please look for the data under '
-             'third_party/icu and update bisect-build.py')
-      sys.exit()
-    os.system('cp %s %s/chrome-linux/' % (icudtl_path, tempdir))
+    CopyMissingFileFromCurrentSource('third_party/icu/common/icudtl.dat',
+                                     '%s/chrome-linux/icudtl.dat' % tempdir)
+    CopyMissingFileFromCurrentSource('*out*/*/libminigbm.so',
+                                     '%s/chrome-linux/libminigbm.so' % tempdir)
 
   os.chdir(tempdir)
 
@@ -779,8 +811,11 @@ def Bisect(context,
       min_str, max_str = 'bad', 'good'
     else:
       min_str, max_str = 'good', 'bad'
-    print 'Bisecting range [%s (%s), %s (%s)].' % (revlist[minrev], min_str,
-                                                   revlist[maxrev], max_str)
+    print ('Bisecting range [%s (%s), %s (%s)], '
+          'roughly %d steps left.') % (revlist[minrev], min_str,
+                                       revlist[maxrev], max_str,
+                                       int(maxrev - minrev)
+                                       .bit_length())
 
     # Pre-fetch next two possible pivots
     #   - down_pivot is the next revision to check if the current revision turns
@@ -982,6 +1017,11 @@ def PrintChangeLog(min_chromium_rev, max_chromium_rev):
   print ('  ' + CHANGELOG_URL % (GetGitHashFromSVNRevision(min_chromium_rev),
          GetGitHashFromSVNRevision(max_chromium_rev)))
 
+def error_internal_option(option, opt, value, parser):
+   raise optparse.OptionValueError(
+         'The -o and -r options are only\navailable in the internal version of '
+         'this script. Google\nemployees should visit http://go/bisect-builds '
+         'for\nconfiguration instructions.')
 
 def main():
   usage = ('%prog [options] [-- chromium-options]\n'
@@ -1067,6 +1107,8 @@ def main():
                     default=False,
                     help='Test the first and last revisions in the range ' +
                          'before proceeding with the bisect.')
+  parser.add_option("-r", action="callback", callback=error_internal_option)
+  parser.add_option("-o", action="callback", callback=error_internal_option)
 
   (opts, args) = parser.parse_args()
 
@@ -1172,3 +1214,4 @@ def main():
 
 if __name__ == '__main__':
   sys.exit(main())
+
