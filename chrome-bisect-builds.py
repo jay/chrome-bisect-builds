@@ -70,6 +70,8 @@ CREDENTIAL_ERROR_MESSAGE = ('You are attempting to access protected data with '
 
 ###############################################################################
 
+import glob
+import httplib
 import json
 import optparse
 import os
@@ -487,6 +489,11 @@ class PathContext(object):
     print
     return revlist
 
+
+def IsMac():
+  return sys.platform.startswith('darwin')
+
+
 def UnzipFilenameToDir(filename, directory):
   """Unzip |filename| to |directory|."""
   if not os.path.isabs(filename):
@@ -540,6 +547,24 @@ def FetchRevision(context, rev, filename, state,
     pass
 
 
+def CopyMissingFileFromCurrentSource(src_glob, dst):
+  """Work around missing files in archives.
+  This happens when archives of Chrome don't contain all of the files
+  needed to build it. In many cases we can work around this using
+  files from the current checkout. The source is in the form of a glob
+  so that it can try to look for possible sources of the file in
+  multiple locations, but we just arbitrarily try the first match.
+
+  Silently fail if this doesn't work because we don't yet have clear
+  markers for builds that require certain files or a way to test
+  whether or not launching Chrome succeeded.
+  """
+  if not os.path.exists(dst):
+    matches = glob.glob(src_glob)
+    if matches:
+      shutil.copy2(matches[0], dst)
+
+
 def RunRevision(context, revision, zip_file, profile, num_runs, command, args):
   """Given a zipped revision, unzip it and run the test."""
   print COLOR_BOLD + 'Trying revision %s...' % revision
@@ -549,17 +574,13 @@ def RunRevision(context, revision, zip_file, profile, num_runs, command, args):
   tempdir = tempfile.mkdtemp(prefix='bisect_tmp')
   UnzipFilenameToDir(zip_file, tempdir)
 
-  # Hack: Chrome OS archives are missing icudtl.dat; try to copy it from
-  # the local directory.
+  # Hack: Some Chrome OS archives are missing some files; try to copy them
+  # from the local directory.
   if context.platform == 'chromeos':
-    icudtl_path = 'third_party/icu/common/icudtl.dat'
-    if not os.access(icudtl_path, os.F_OK):
-      print COLOR_ERROR + 'Couldn\'t find: ' + icudtl_path
-      print (COLOR_NORMAL +
-             'The path might have changed. Please look for the data under '
-             'third_party/icu and update bisect-build.py')
-      sys.exit()
-    os.system('cp %s %s/chrome-linux/' % (icudtl_path, tempdir))
+    CopyMissingFileFromCurrentSource('third_party/icu/common/icudtl.dat',
+                                     '%s/chrome-linux/icudtl.dat' % tempdir)
+    CopyMissingFileFromCurrentSource('*out*/*/libminigbm.so',
+                                     '%s/chrome-linux/libminigbm.so' % tempdir)
 
   os.chdir(tempdir)
 
@@ -855,8 +876,11 @@ def Bisect(context,
       min_str, max_str = 'bad', 'good'
     else:
       min_str, max_str = 'good', 'bad'
-    print COLOR_NORMAL + '\rBisecting range [%s (%s), %s (%s)], %d revs.' % (revlist[minrev], min_str,
-                                                   revlist[maxrev], max_str, revlist[maxrev] - revlist[minrev])
+    print (COLOR_NORMAL + '\rBisecting range [%s (%s), %s (%s)], '
+          '~%d steps left.') % (revlist[minrev], min_str,
+                                       revlist[maxrev], max_str,
+                                       int(maxrev - minrev)
+                                       .bit_length())
 
     # Pre-fetch next two possible pivots
     #   - down_pivot is the next revision to check if the current revision turns
@@ -1059,6 +1083,11 @@ def PrintChangeLog(min_chromium_rev, max_chromium_rev):
          CHANGELOG_URL % (GetGitHashFromSVNRevision(min_chromium_rev)[:8],
          GetGitHashFromSVNRevision(max_chromium_rev)[:8]))
 
+def error_internal_option(option, opt, value, parser):
+   raise optparse.OptionValueError(
+         'The -o and -r options are only\navailable in the internal version of '
+         'this script. Google\nemployees should visit http://go/bisect-builds '
+         'for\nconfiguration instructions.')
 
 def main():
   usage = ('%prog [options] [-- chromium-options]\n'
@@ -1144,6 +1173,8 @@ def main():
                     default=False,
                     help='Test the first and last revisions in the range ' +
                          'before proceeding with the bisect.')
+  parser.add_option("-r", action="callback", callback=error_internal_option)
+  parser.add_option("-o", action="callback", callback=error_internal_option)
 
   (opts, args) = parser.parse_args()
 
@@ -1255,3 +1286,4 @@ def main():
 
 if __name__ == '__main__':
   sys.exit(main())
+
